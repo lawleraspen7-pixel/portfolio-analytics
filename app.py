@@ -2,15 +2,16 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import os
+import math
+import pandas as pd
+import numpy as np
+import yfinance as yf
 
 SECRET = os.environ["SECRET"]
 
 app = FastAPI()
 
 
-# =========================
-# Models
-# =========================
 class Position(BaseModel):
     row: Optional[int] = None
     ticker: str
@@ -30,23 +31,19 @@ class Snapshot(BaseModel):
 
 
 # =========================
-# Config
+# Strategy config
 # =========================
-TARGET_INVESTED_WEIGHT = 0.85
-MAX_POSITION_WEIGHT = 0.20
-MAX_SECTOR_WEIGHT = 0.35
+TOP_N = 3
+MOMENTUM_LOOKBACK = 90
+VOL_LOOKBACK = 20
+TREND_LOOKBACK = 20
 
-REBALANCE_ALPHA = 0.25          # move 25% toward ideal per run
-MAX_DAILY_TURNOVER = 0.25       # max abs trade dollars as % of portfolio per day
-
-MIN_TRADE_DOLLARS = 50.0
+TARGET_INVESTED_WEIGHT = 1.0
+MIN_TRADE_DOLLARS = 300.0
 MIN_SHARE_DELTA = 0.10
+MIN_WEIGHT_CHANGE = 0.03
 
-# soft behavior controls
-SELL_BIAS = 0.20                # easier to reduce names explicitly marked SELL
-KEEP_FLOOR_NON_SELL = 0.015     # don't zero tiny non-sell positions too aggressively
-HIGH_VOL_CUTOFF = 0.80
-LOW_VOL_CUTOFF = 0.30
+DOWNLOAD_PERIOD = "9mo"
 
 
 # =========================
@@ -77,88 +74,80 @@ def clean_sector(x: str) -> str:
     return x if x else "Unknown"
 
 
-def force_scale_to_sum(items: List[Dict[str, Any]], key: str, target_sum: float) -> None:
-    current_sum = sum(max(0.0, float(item.get(key, 0.0))) for item in items)
-    if current_sum <= 0:
-        return
-    scale = target_sum / current_sum
-    for item in items:
-        item[key] = max(0.0, float(item.get(key, 0.0)) * scale)
+def annualized_vol_from_returns(returns: pd.Series) -> float:
+    if returns is None or len(returns.dropna()) == 0:
+        return 0.0
+    return float(returns.std(ddof=0) * math.sqrt(252))
 
 
-def apply_position_cap(items: List[Dict[str, Any]], key: str, cap: float) -> None:
-    # iterative cap + redistribute among uncapped positive weights
-    for _ in range(10):
-        total = sum(max(0.0, float(item.get(key, 0.0))) for item in items)
-        if total <= 0:
-            return
+def build_price_frame(tickers: List[str]) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame()
 
-        excess = 0.0
-        uncapped_total = 0.0
+    data = yf.download(
+        tickers=tickers,
+        period=DOWNLOAD_PERIOD,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        group_by="ticker",
+        threads=True,
+    )
 
-        for item in items:
-            w = max(0.0, float(item.get(key, 0.0)))
-            if w > cap:
-                excess += w - cap
-                item[key] = cap
-            else:
-                uncapped_total += w
+    if data is None or getattr(data, "empty", True):
+        return pd.DataFrame()
 
-        if excess <= 1e-9:
-            return
+    if isinstance(data.columns, pd.MultiIndex):
+        close_frames = []
+        for ticker in tickers:
+            if (ticker, "Close") in data.columns:
+                close_frames.append(data[(ticker, "Close")].rename(ticker))
+        if not close_frames:
+            return pd.DataFrame()
+        close = pd.concat(close_frames, axis=1)
+    else:
+        if "Close" not in data.columns or len(tickers) != 1:
+            return pd.DataFrame()
+        close = data[["Close"]].rename(columns={"Close": tickers[0]})
 
-        if uncapped_total <= 1e-9:
-            return
-
-        for item in items:
-            w = max(0.0, float(item.get(key, 0.0)))
-            if w < cap:
-                item[key] = w + excess * (w / uncapped_total)
+    close = close.sort_index().ffill().dropna(how="all")
+    return close
 
 
-def apply_sector_cap(items: List[Dict[str, Any]], key: str, sector_key: str, sector_cap: float) -> None:
-    # iterative soft enforcement
-    for _ in range(12):
-        sector_totals: Dict[str, float] = {}
-        total = 0.0
-        for item in items:
-            w = max(0.0, float(item.get(key, 0.0)))
-            s = str(item.get(sector_key, "Unknown"))
-            sector_totals[s] = sector_totals.get(s, 0.0) + w
-            total += w
+def compute_momentum_model(close: pd.DataFrame) -> Dict[str, Any]:
+    if close.empty:
+        return {
+            "latest_scores": {},
+            "latest_momentum": {},
+            "latest_trend": {},
+            "latest_vol": {},
+            "selected": [],
+            "valid_tickers": []
+        }
 
-        if total <= 0:
-            return
+    returns = close.pct_change()
+    momentum = close / close.shift(MOMENTUM_LOOKBACK) - 1.0
+    vol = returns.rolling(VOL_LOOKBACK).std(ddof=0)
+    trend = close / close.shift(TREND_LOOKBACK) - 1.0
 
-        over = {s: w for s, w in sector_totals.items() if w > sector_cap}
-        if not over:
-            return
+    score = momentum / vol.replace(0.0, np.nan)
+    score = score.where(trend > 0)
 
-        freed = 0.0
-        eligible_total = 0.0
+    latest_score_row = score.iloc[-1].dropna().sort_values(ascending=False)
+    latest_momentum_row = momentum.iloc[-1].to_dict()
+    latest_trend_row = trend.iloc[-1].to_dict()
+    latest_vol_row = vol.iloc[-1].to_dict()
 
-        for item in items:
-            s = str(item.get(sector_key, "Unknown"))
-            w = max(0.0, float(item.get(key, 0.0)))
-            if s in over and sector_totals[s] > 0:
-                ratio = sector_cap / sector_totals[s]
-                new_w = w * ratio
-                freed += w - new_w
-                item[key] = new_w
+    selected = latest_score_row.head(TOP_N).index.tolist()
 
-        for item in items:
-            s = str(item.get(sector_key, "Unknown"))
-            if s not in over:
-                eligible_total += max(0.0, float(item.get(key, 0.0)))
-
-        if freed <= 1e-9 or eligible_total <= 1e-9:
-            return
-
-        for item in items:
-            s = str(item.get(sector_key, "Unknown"))
-            if s not in over:
-                w = max(0.0, float(item.get(key, 0.0)))
-                item[key] = w + freed * (w / eligible_total)
+    return {
+        "latest_scores": {k: float(v) for k, v in latest_score_row.to_dict().items() if pd.notna(v)},
+        "latest_momentum": {k: float(v) for k, v in latest_momentum_row.items() if pd.notna(v)},
+        "latest_trend": {k: float(v) for k, v in latest_trend_row.items() if pd.notna(v)},
+        "latest_vol": {k: float(v) for k, v in latest_vol_row.items() if pd.notna(v)},
+        "selected": selected,
+        "valid_tickers": list(close.columns)
+    }
 
 
 @app.get("/health")
@@ -171,7 +160,7 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
     if x_analytics_secret != SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    positions = []
+    positions: List[Dict[str, Any]] = []
     for raw in snapshot.positions:
         ticker = clean_ticker(raw.ticker)
         if not ticker or ticker == "CASH":
@@ -191,6 +180,7 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
         })
 
     total_value = sum(p["own"] * p["price"] for p in positions)
+
     if total_value <= 0:
         return {
             "metrics": {
@@ -215,12 +205,21 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
             }
         }
 
+    tickers = [p["ticker"] for p in positions]
     buy_count = sum(1 for p in positions if p["execute"].startswith("BUY"))
     sell_count = sum(1 for p in positions if p["execute"].startswith("SELL"))
-    vols = [p["vol"] for p in positions if p["vol"] > 0]
-    avg_vol = sum(vols) / len(vols) if vols else 0.0
 
-    # current sector map
+    close = build_price_frame(tickers)
+    model = compute_momentum_model(close)
+
+    latest_scores = model["latest_scores"]
+    latest_momentum = model["latest_momentum"]
+    latest_trend = model["latest_trend"]
+    latest_vol = model["latest_vol"]
+    selected = model["selected"]
+    valid_tickers = set(model["valid_tickers"])
+
+    # Sector map from current holdings
     sector_values: Dict[str, float] = {}
     for p in positions:
         value = p["own"] * p["price"]
@@ -232,200 +231,110 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
     }
 
     diagnostics = []
-    positive_alloc_scores: Dict[str, float] = {}
+    target_weights: Dict[str, float] = {}
 
-    # =========================
-    # Score positions
-    # =========================
+    if selected:
+        equal_weight = TARGET_INVESTED_WEIGHT / len(selected)
+        for ticker in tickers:
+            target_weights[ticker] = equal_weight if ticker in selected else 0.0
+    else:
+        for ticker in tickers:
+            target_weights[ticker] = 0.0
+
+    portfolio_flags = []
+    if len(selected) < TOP_N:
+        portfolio_flags.append("partial_cash_signal")
+    if len(valid_tickers) < len(tickers):
+        portfolio_flags.append("missing_market_data")
+    if not selected:
+        portfolio_flags.append("no_positive_trend_candidates")
+
+    # Diagnostics
     for p in positions:
         ticker = p["ticker"]
         value = p["own"] * p["price"]
         weight = safe_div(value, total_value, 0.0)
-        gap_shares = p["targetShares"] - p["own"]
-        gap_value = gap_shares * p["price"]
         sector_weight = current_sector_weights.get(p["sector"], 0.0)
         unrealized_pct = safe_div((p["price"] - p["costBasis"]), p["costBasis"], 0.0) if p["costBasis"] > 0 else 0.0
 
-        is_buy = p["execute"].startswith("BUY")
-        is_sell = p["execute"].startswith("SELL")
-        is_hold = not is_buy and not is_sell
-
-        # base preference from execute
-        signal_score = 0.0
-        if is_buy:
-            signal_score += 1.00
-        elif is_sell:
-            signal_score -= 1.00
-
-        # structure penalties / rewards
-        vol_penalty = p["vol"] * 0.55
-        size_penalty = max(0.0, weight - 0.12) * 3.20
-        sector_penalty = max(0.0, sector_weight - 0.30) * 2.25
-        gap_strength = clamp(abs(gap_value) / total_value, 0.0, 0.20) * 5.50
-
-        if is_buy:
-            signal_score += 0.50
-            signal_score += gap_strength
-            signal_score -= vol_penalty
-            signal_score -= size_penalty
-            signal_score -= sector_penalty
-
-            if p["vol"] < LOW_VOL_CUTOFF:
-                signal_score += 0.20
-            if p["vol"] > HIGH_VOL_CUTOFF:
-                signal_score -= 0.35
-            if unrealized_pct > 0.10:
-                signal_score += 0.10
-
-        elif is_sell:
-            signal_score -= 0.50
-            signal_score -= SELL_BIAS
-            signal_score += size_penalty
-            signal_score += sector_penalty
-            signal_score += gap_strength
-
-            if p["vol"] > HIGH_VOL_CUTOFF:
-                signal_score -= 0.20
-            if unrealized_pct < -0.08:
-                signal_score -= 0.15
-
-        elif is_hold:
-            signal_score -= vol_penalty * 0.25
-            signal_score -= size_penalty * 0.25
-            signal_score -= sector_penalty * 0.20
-
-            if unrealized_pct > 0.10 and p["vol"] < 0.40:
-                signal_score += 0.20
-            if unrealized_pct < -0.15 and p["vol"] > 0.70:
-                signal_score -= 0.20
-
-        signal_score = clamp(signal_score, -3.0, 3.0)
-        conviction_score = clamp(signal_score / 3.0, -1.0, 1.0)
-
-        # positive pool for allocation
-        alloc_score = max(0.0, conviction_score)
-        if is_sell:
-            alloc_score = 0.0
-        positive_alloc_scores[ticker] = alloc_score
+        momentum_90d = latest_momentum.get(ticker)
+        trend_20d = latest_trend.get(ticker)
+        vol_20d = latest_vol.get(ticker)
+        score = latest_scores.get(ticker)
 
         comments = []
-        if abs(gap_shares) > 0:
-            comments.append(f"share_gap={gap_shares:.3f}")
-        if abs(gap_value) > 0:
-            comments.append(f"gap_value={gap_value:.2f}")
+        if ticker in selected:
+            comments.append("selected_top_momentum")
+        if ticker not in valid_tickers:
+            comments.append("missing_price_history")
+        if trend_20d is not None and trend_20d <= 0:
+            comments.append("trend_filter_failed")
+        if vol_20d is not None and vol_20d > 0.50:
+            comments.append("higher_recent_vol")
         if weight > 0.20:
             comments.append("oversized")
         if sector_weight > 0.35:
             comments.append("crowded_sector")
-        if p["vol"] > HIGH_VOL_CUTOFF:
-            comments.append("high_vol")
-        elif p["vol"] < LOW_VOL_CUTOFF:
-            comments.append("lower_vol")
-        if unrealized_pct < -0.10:
-            comments.append("deep_loser")
-        elif unrealized_pct > 0.15:
-            comments.append("strong_winner")
-        if is_buy:
-            comments.append("buy_signal")
-        elif is_sell:
-            comments.append("sell_signal")
+
+        conviction_score = 0.0
+        if score is not None:
+            conviction_score = float(score)
 
         diagnostics.append({
             "row": p["row"],
             "ticker": ticker,
             "sector": p["sector"],
-            "signalScore": round(signal_score, 4),
+            "signalScore": round(conviction_score, 4),
             "convictionScore": round(conviction_score, 4),
-            "riskScore": round(clamp(p["vol"], 0.0, 1.5), 4),
+            "riskScore": round(float(vol_20d) if vol_20d is not None else 0.0, 4),
             "weight": round(weight, 4),
             "sectorWeight": round(sector_weight, 4),
             "currentDollarValue": round(value, 2),
             "unrealizedPct": round(unrealized_pct, 4),
-            "gapShares": round(gap_shares, 4),
-            "gapValue": round(gap_value, 2),
-            "comment": ", ".join(comments)
+            "gapShares": round(target_weights.get(ticker, 0.0) * total_value / p["price"] - p["own"], 4) if p["price"] > 0 else 0.0,
+            "gapValue": round(target_weights.get(ticker, 0.0) * total_value - value, 2),
+            "comment": ", ".join(comments),
+            "momentum90d": round(float(momentum_90d), 4) if momentum_90d is not None else None,
+            "trend20d": round(float(trend_20d), 4) if trend_20d is not None else None,
+            "vol20d": round(float(vol_20d), 4) if vol_20d is not None else None
         })
 
-    conviction_map = {d["ticker"]: d["convictionScore"] for d in diagnostics}
-    positive_total = sum(positive_alloc_scores.values())
+    diagnostics.sort(key=lambda d: (d["convictionScore"] if d["convictionScore"] is not None else -999999), reverse=True)
 
-    # =========================
-    # Build ideal target weights
-    # =========================
-    target_rows = []
+    suggested_targets = []
     for p in positions:
         ticker = p["ticker"]
-        current_weight = safe_div(p["own"] * p["price"], total_value, 0.0)
-        alloc_score = positive_alloc_scores.get(ticker, 0.0)
-
-        ideal_weight = 0.0
-        if positive_total > 0 and alloc_score > 0:
-            ideal_weight = (alloc_score / positive_total) * TARGET_INVESTED_WEIGHT
-
-        # Do not crush non-sell names straight to zero.
-        if not p["execute"].startswith("SELL"):
-            ideal_weight = max(ideal_weight, min(current_weight, KEEP_FLOOR_NON_SELL))
-
-        target_rows.append({
+        suggested_targets.append({
             "ticker": ticker,
             "sector": p["sector"],
-            "currentWeight": current_weight,
-            "idealWeight": ideal_weight,
-            "convictionScore": conviction_map.get(ticker, 0.0)
+            "suggestedTargetWeight": round(target_weights.get(ticker, 0.0), 4),
+            "convictionScore": round(float(latest_scores.get(ticker, 0.0)), 4)
         })
 
-    # Enforce structure on ideal portfolio
-    force_scale_to_sum(target_rows, "idealWeight", TARGET_INVESTED_WEIGHT)
-    apply_position_cap(target_rows, "idealWeight", MAX_POSITION_WEIGHT)
-    force_scale_to_sum(target_rows, "idealWeight", TARGET_INVESTED_WEIGHT)
-    apply_sector_cap(target_rows, "idealWeight", "sector", MAX_SECTOR_WEIGHT)
-    force_scale_to_sum(target_rows, "idealWeight", TARGET_INVESTED_WEIGHT)
-
-    # Blend from current -> ideal
-    suggested_targets = []
-    for row in target_rows:
-        suggested_weight = (
-            row["currentWeight"] * (1.0 - REBALANCE_ALPHA) +
-            row["idealWeight"] * REBALANCE_ALPHA
-        )
-        suggested_targets.append({
-            "ticker": row["ticker"],
-            "sector": row["sector"],
-            "suggestedTargetWeight": suggested_weight,
-            "convictionScore": row["convictionScore"]
-        })
-
-    # Re-apply structure after blending
-    force_scale_to_sum(suggested_targets, "suggestedTargetWeight", TARGET_INVESTED_WEIGHT)
-    apply_position_cap(suggested_targets, "suggestedTargetWeight", MAX_POSITION_WEIGHT)
-    force_scale_to_sum(suggested_targets, "suggestedTargetWeight", TARGET_INVESTED_WEIGHT)
-    apply_sector_cap(suggested_targets, "suggestedTargetWeight", "sector", MAX_SECTOR_WEIGHT)
-    force_scale_to_sum(suggested_targets, "suggestedTargetWeight", TARGET_INVESTED_WEIGHT)
-
-    for row in suggested_targets:
-        row["suggestedTargetWeight"] = round(row["suggestedTargetWeight"], 4)
-
+    suggested_targets.sort(key=lambda d: d["suggestedTargetWeight"], reverse=True)
     target_weight_map = {x["ticker"]: x["suggestedTargetWeight"] for x in suggested_targets}
 
-    # =========================
-    # Turn targets into trade decisions
-    # =========================
     decision_trades = []
     for p in positions:
         ticker = p["ticker"]
         price = p["price"]
         current_value = p["own"] * price
+        current_weight = safe_div(current_value, total_value, 0.0)
         suggested_weight = target_weight_map.get(ticker, 0.0)
         suggested_dollar_target = suggested_weight * total_value
         delta_dollar = suggested_dollar_target - current_value
         suggested_shares = safe_div(suggested_dollar_target, price, 0.0) if price > 0 else 0.0
         share_change = suggested_shares - p["own"]
-        conviction_score = conviction_map.get(ticker, 0.0)
+        weight_change = suggested_weight - current_weight
 
         action_final = "HOLD"
-        if abs(delta_dollar) >= MIN_TRADE_DOLLARS and abs(share_change) >= MIN_SHARE_DELTA:
+        if (
+            (abs(delta_dollar) >= MIN_TRADE_DOLLARS or abs(weight_change) >= MIN_WEIGHT_CHANGE)
+            and abs(share_change) >= MIN_SHARE_DELTA
+        ):
             action_final = "BUY" if share_change > 0 else "SELL"
 
+        conviction_score = float(latest_scores.get(ticker, 0.0))
         priority_score = abs(delta_dollar) * (1.0 + abs(conviction_score))
 
         decision_trades.append({
@@ -442,61 +351,34 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
             "priorityScore": round(priority_score, 2)
         })
 
-    # Turnover cap
-    total_abs_trade = sum(abs(t["deltaDollar"]) for t in decision_trades)
-    max_abs_trade = total_value * MAX_DAILY_TURNOVER
-
-    if total_abs_trade > max_abs_trade and total_abs_trade > 0:
-        scale = max_abs_trade / total_abs_trade
-        for t in decision_trades:
-            scaled_delta = t["deltaDollar"] * scale
-            price = next((p["price"] for p in positions if p["ticker"] == t["ticker"]), 0.0)
-            current_shares = t["currentShares"]
-            suggested_dollar_target = t["currentDollarValue"] + scaled_delta
-            suggested_shares = safe_div(suggested_dollar_target, price, current_shares) if price > 0 else current_shares
-            share_change = suggested_shares - current_shares
-
-            t["deltaDollar"] = round(scaled_delta, 2)
-            t["suggestedDollarTarget"] = round(suggested_dollar_target, 2)
-            t["suggestedShares"] = round_shares(suggested_shares)
-            t["shareChange"] = round_shares(share_change)
-
-            if abs(t["deltaDollar"]) >= MIN_TRADE_DOLLARS and abs(t["shareChange"]) >= MIN_SHARE_DELTA:
-                t["actionFinal"] = "BUY" if t["shareChange"] > 0 else "SELL"
-            else:
-                t["actionFinal"] = "HOLD"
-
-            conviction_score = conviction_map.get(t["ticker"], 0.0)
-            t["priorityScore"] = round(abs(t["deltaDollar"]) * (1.0 + abs(conviction_score)), 2)
-
     decision_trades.sort(key=lambda x: x["priorityScore"], reverse=True)
     actionable_trades = [t for t in decision_trades if t["actionFinal"] != "HOLD"]
 
-    # target sector weights
-    target_sector_weights: Dict[str, float] = {}
-    for row in suggested_targets:
-        target_sector_weights[row["sector"]] = target_sector_weights.get(row["sector"], 0.0) + row["suggestedTargetWeight"]
-
-    portfolio_flags = []
-    if avg_vol > 0.65:
-        portfolio_flags.append("portfolio_vol_high")
+    if len(actionable_trades) >= 8:
+        portfolio_flags.append("high_turnover_signal_load")
     if any(w > 0.35 for w in current_sector_weights.values()):
         portfolio_flags.append("sector_concentration_high")
     if any(d["weight"] > 0.25 for d in diagnostics):
         portfolio_flags.append("single_name_concentration_high")
-    if len(actionable_trades) >= 8:
-        portfolio_flags.append("high_turnover_signal_load")
 
-    diagnostics.sort(key=lambda d: d["convictionScore"], reverse=True)
-    suggested_targets.sort(key=lambda d: d["suggestedTargetWeight"], reverse=True)
+    target_sector_weights: Dict[str, float] = {}
+    all_sectors = set(current_sector_weights.keys())
+    for row in suggested_targets:
+        s = row["sector"]
+        all_sectors.add(s)
+        target_sector_weights[s] = target_sector_weights.get(s, 0.0) + row["suggestedTargetWeight"]
 
-    top_buys = [d["ticker"] for d in diagnostics if d["convictionScore"] > 0][:5]
-    weakest = [d["ticker"] for d in sorted(diagnostics, key=lambda d: d["convictionScore"])][:5]
+    avg_vol = annualized_vol_from_returns(close.pct_change().tail(VOL_LOOKBACK).stack()) if not close.empty else 0.0
+    top_buys = [ticker for ticker in selected][:5]
+    weakest = [d["ticker"] for d in diagnostics[-5:]]
 
     top_actions = actionable_trades[:8]
     summary_lines = []
     if not top_actions:
-        summary_lines.append("No meaningful trades today. Hold current positions.")
+        if selected:
+            summary_lines.append("No meaningful trades today. Current holdings already near target.")
+        else:
+            summary_lines.append("No qualifying momentum candidates. Stay in cash / hold no-trade posture.")
     else:
         for t in top_actions:
             if t["actionFinal"] == "BUY":
@@ -515,29 +397,21 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
             "topBuys": ", ".join(top_buys),
             "weakestNames": ", ".join(weakest),
             "portfolioFlags": ", ".join(portfolio_flags) if portfolio_flags else "none",
-            "targetInvestedWeight": round(TARGET_INVESTED_WEIGHT, 4),
-            "maxPositionWeight": round(MAX_POSITION_WEIGHT, 4),
-            "maxSectorWeight": round(MAX_SECTOR_WEIGHT, 4),
-            "rebalanceAlpha": round(REBALANCE_ALPHA, 4),
-            "maxDailyTurnover": round(MAX_DAILY_TURNOVER, 4)
+            "selectedCount": len(selected),
+            "topN": TOP_N,
+            "momentumLookback": MOMENTUM_LOOKBACK,
+            "volLookback": VOL_LOOKBACK,
+            "trendLookback": TREND_LOOKBACK
         },
         "diagnostics": diagnostics,
-        "suggestedTargets": [
-            {
-                "ticker": x["ticker"],
-                "sector": x["sector"],
-                "suggestedTargetWeight": x["suggestedTargetWeight"],
-                "convictionScore": x["convictionScore"]
-            }
-            for x in suggested_targets
-        ],
+        "suggestedTargets": suggested_targets,
         "sectorWeights": [
             {
                 "sector": sector,
                 "currentWeight": round(current_sector_weights.get(sector, 0.0), 4),
-                "targetWeight": round(weight, 4)
+                "targetWeight": round(target_sector_weights.get(sector, 0.0), 4)
             }
-            for sector, weight in sorted(target_sector_weights.items(), key=lambda kv: kv[1], reverse=True)
+            for sector in sorted(all_sectors, key=lambda s: target_sector_weights.get(s, 0.0), reverse=True)
         ],
         "decisionTrades": decision_trades,
         "emailSummary": {
