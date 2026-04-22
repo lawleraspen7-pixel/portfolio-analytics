@@ -33,19 +33,20 @@ class Snapshot(BaseModel):
 # =========================
 # Final live config
 # =========================
-TOP_N = 4
+TOP_N = 3
 MOMENTUM_LOOKBACK = 60
 VOL_LOOKBACK = 20
 TREND_LOOKBACK = 20
 
 DOWNLOAD_PERIOD = "12mo"
 
-MIN_TRADE_DOLLARS = 300.0
+MIN_TRADE_DOLLARS = 750.0
 MIN_SHARE_DELTA = 0.10
-MIN_WEIGHT_CHANGE = 0.03
+MIN_WEIGHT_CHANGE = 0.05
+MIN_SELECTED_WEIGHT = 0.15
 
-MAX_WEIGHT_SHIFT_PER_DAY = 0.10
-MAX_DAILY_TURNOVER = 0.15
+MAX_WEIGHT_SHIFT_PER_DAY = 0.15
+MAX_DAILY_TURNOVER = 0.35
 
 REGIME_BENCHMARKS = ["SPY", "QQQ"]
 REGIME_MA_LOOKBACK = 200
@@ -53,21 +54,18 @@ RISK_OFF_INVESTED_WEIGHT = 0.35
 NORMAL_INVESTED_WEIGHT = 1.0
 
 LEVERAGED_TICKERS = {"SOXL", "TQQQ", "SPXL", "TECL", "UPRO", "FNGU"}
-LEVERAGED_ETF_CAP = 0.15
+LEVERAGED_ETF_CAP = 0.20
 
 REQUIRE_FULL_LOOKBACK = True
 USE_BENCHMARK_RELATIVE_FILTER = True
-MIN_QUALIFIERS_TO_STAY_FULLY_INVESTED = 3
+MIN_QUALIFIERS_TO_STAY_FULLY_INVESTED = 2
 
 HIGH_CONFIDENCE_UNIVERSE = {
     "SPY", "QQQ", "XLK", "XLF", "XLE", "XLI", "XLY", "SMH", "SOXX",
-    "NVDA", "AMD", "MSFT", "AAPL", "AMZN", "META", "AVGO"
+    "NVDA", "AMD", "MSFT", "AAPL", "AMZN", "META", "AVGO", "SOXL"
 }
 
 
-# =========================
-# Helpers
-# =========================
 def safe_div(a: float, b: float, default: float = 0.0) -> float:
     return a / b if abs(b) > 1e-12 else default
 
@@ -229,6 +227,44 @@ def apply_leveraged_cap(ticker: str, weight: float, risk_on: bool) -> float:
     return weight
 
 
+def enforce_min_selected_weight(weights: Dict[str, float], selected: List[str], target_sum: float) -> Dict[str, float]:
+    if not selected:
+        return {k: 0.0 for k in weights}
+    out = dict(weights)
+    positive_selected = [t for t in selected if out.get(t, 0.0) > 0]
+    if not positive_selected:
+        return out
+
+    floors = {t: MIN_SELECTED_WEIGHT for t in positive_selected}
+    floor_sum = sum(floors.values())
+    if floor_sum > target_sum:
+        scale = target_sum / floor_sum
+        floors = {k: v * scale for k, v in floors.items()}
+
+    current_sum = sum(max(0.0, out.get(t, 0.0)) for t in positive_selected)
+    if current_sum <= 0:
+        for t in positive_selected:
+            out[t] = floors[t]
+        return out
+
+    freed = 0.0
+    for t in list(out.keys()):
+        if t not in positive_selected:
+            freed += max(0.0, out[t])
+            out[t] = 0.0
+
+    for t in positive_selected:
+        out[t] = max(out.get(t, 0.0), floors[t])
+
+    total = sum(max(0.0, out.get(k, 0.0)) for k in out)
+    if total <= 0:
+        return out
+
+    scale = target_sum / total
+    out = {k: max(0.0, v) * scale for k, v in out.items()}
+    return out
+
+
 def rescale_weights(weights: Dict[str, float], target_sum: float) -> Dict[str, float]:
     total = sum(max(0.0, v) for v in weights.values())
     if total <= 0:
@@ -343,6 +379,8 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
     for p in positions:
         t = p["ticker"]
         adjusted[t] = apply_leveraged_cap(t, ideal_weights.get(t, 0.0), risk_on)
+
+    adjusted = enforce_min_selected_weight(adjusted, selected, target_invested_weight)
     adjusted = rescale_weights(adjusted, target_invested_weight) if target_invested_weight > 0 else adjusted
 
     target_weights = {}
@@ -515,7 +553,7 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
     top_buys = selected[:5]
     weakest = [d["ticker"] for d in diagnostics[-5:]]
 
-    top_actions = actionable_trades[:8]
+    top_actions = actionable_trades[:6]
     summary_lines = []
     if not top_actions:
         if selected:
