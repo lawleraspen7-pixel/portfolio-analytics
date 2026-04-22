@@ -31,44 +31,42 @@ class Snapshot(BaseModel):
 
 
 # =========================
-# Final concentrated live config
+# Locked live config
 # =========================
 TOP_N = 2
 MOMENTUM_LOOKBACK = 60
 VOL_LOOKBACK = 20
 TREND_LOOKBACK = 20
-
+REGIME_MA_LOOKBACK = 200
 DOWNLOAD_PERIOD = "12mo"
 
-MIN_TRADE_DOLLARS = 300.0
+MIN_TRADE_DOLLARS = 500.0
 MIN_SHARE_DELTA = 0.10
-MIN_WEIGHT_CHANGE = 0.03
-MIN_TRADE_PCT = 0.05
+MIN_WEIGHT_CHANGE = 0.04
+MIN_TRADE_PCT = 0.04
 
-MIN_WEIGHT = 0.10
-MAX_WEIGHT = 0.60
+MIN_WEIGHT = 0.15
+MAX_WEIGHT = 0.65
 MAX_WEIGHT_SHIFT_PER_DAY = 0.20
-TURNOVER_CAP = 0.20
+TURNOVER_CAP = 0.25
 
-REGIME_BENCHMARKS = ["SPY", "QQQ"]
-REGIME_MA_LOOKBACK = 200
-RISK_OFF_INVESTED_WEIGHT = 0.35
 NORMAL_INVESTED_WEIGHT = 1.0
+RISK_OFF_INVESTED_WEIGHT = 0.70
 
-LEVERAGED_TICKERS = {"SOXL", "TQQQ", "SPXL", "TECL", "UPRO", "FNGU"}
 LEVERAGED_ETF_CAP = 0.15
-
 REQUIRE_FULL_LOOKBACK = True
 USE_BENCHMARK_RELATIVE_FILTER = True
 MIN_QUALIFIERS_TO_STAY_FULLY_INVESTED = 2
+
+REGIME_BENCHMARKS = ["SPY", "QQQ"]
+LEVERAGED_TICKERS = {"SOXL", "TQQQ", "SPXL", "TECL", "UPRO", "FNGU"}
+SEMI_ETFS = {"SMH", "SOXL"}
+SEMI_NAMES = {"NVDA", "AMD", "AVGO"}
 
 HIGH_CONFIDENCE_UNIVERSE = {
     "SPY", "QQQ", "XLK", "XLF", "XLE", "XLI", "XLY", "SMH", "SOXX",
     "NVDA", "AMD", "MSFT", "AAPL", "AMZN", "META", "AVGO", "SOXL"
 }
-
-SEMI_ETFS = {"SMH", "SOXL"}
-SEMI_NAMES = {"NVDA", "AMD", "AVGO"}
 
 
 def safe_div(a: float, b: float, default: float = 0.0) -> float:
@@ -200,9 +198,9 @@ def compute_model(close: pd.DataFrame, candidate_tickers: List[str]) -> Dict[str
 
     latest_score_row = score.iloc[-1].dropna().sort_values(ascending=False)
 
+    # pull extra names so overlap rule can remove components and still leave enough candidates
     selected = latest_score_row.head(max(TOP_N + 3, 5)).index.tolist()
 
-    # Prevent overlap: if any semi ETF selected, remove semi single names
     if any(t in selected for t in SEMI_ETFS):
         selected = [t for t in selected if t not in SEMI_NAMES]
 
@@ -230,7 +228,6 @@ def apply_leveraged_cap(ticker: str, weight: float, risk_on: bool) -> float:
 def cap_and_renormalize(weights: Dict[str, float], selected: List[str], target_sum: float) -> Dict[str, float]:
     out = {k: max(0.0, v) for k, v in weights.items()}
 
-    # zero non-selected
     for k in list(out.keys()):
         if k not in selected:
             out[k] = 0.0
@@ -238,7 +235,6 @@ def cap_and_renormalize(weights: Dict[str, float], selected: List[str], target_s
     if not selected or target_sum <= 0:
         return {k: 0.0 for k in out}
 
-    # apply minimum weights to selected names
     min_sum = MIN_WEIGHT * len(selected)
     if min_sum > target_sum:
         floor = target_sum / len(selected)
@@ -248,17 +244,16 @@ def cap_and_renormalize(weights: Dict[str, float], selected: List[str], target_s
         for t in selected:
             out[t] = max(out.get(t, 0.0), MIN_WEIGHT)
 
-    # renormalize
     total = sum(out.values())
     if total > 0:
         scale = target_sum / total
         out = {k: v * scale for k, v in out.items()}
 
-    # apply max cap iteratively
     for _ in range(10):
         capped = {}
         excess = 0.0
         uncapped = []
+
         for t in selected:
             w = out.get(t, 0.0)
             cap = LEVERAGED_ETF_CAP if t in LEVERAGED_TICKERS else MAX_WEIGHT
@@ -282,7 +277,6 @@ def cap_and_renormalize(weights: Dict[str, float], selected: List[str], target_s
             capped[t] += excess * (capped[t] / uncapped_total)
         out.update(capped)
 
-    # final renormalize
     total = sum(out.values())
     if total > 0:
         scale = target_sum / total
@@ -383,7 +377,11 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
     if not selected:
         portfolio_flags.append("no_positive_trend_candidates")
 
-    target_invested_weight = NORMAL_INVESTED_WEIGHT if risk_on else RISK_OFF_INVESTED_WEIGHT
+    if risk_on:
+        target_invested_weight = NORMAL_INVESTED_WEIGHT
+    else:
+        target_invested_weight = RISK_OFF_INVESTED_WEIGHT
+
     if len(selected) < MIN_QUALIFIERS_TO_STAY_FULLY_INVESTED:
         target_invested_weight = min(target_invested_weight, len(selected) / max(TOP_N, 1)) if selected else 0.0
 
@@ -393,7 +391,6 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
         for t in selected:
             ideal_weights[t] = equal_w
 
-    # leverage control + concentration rules
     adjusted = {}
     for p in positions:
         t = p["ticker"]
@@ -407,7 +404,6 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
         current_w = current_weight_map.get(t, 0.0)
         ideal_w = adjusted.get(t, 0.0)
 
-        # selected names can move up faster, non-selected exit directly
         if t in selected:
             diff = ideal_w - current_w
             if abs(diff) <= MAX_WEIGHT_SHIFT_PER_DAY:
