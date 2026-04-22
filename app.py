@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-SECRET = os.environ["SECRET"]
+SECRET = os.environ.get("SECRET", "dev-secret")
 
 app = FastAPI()
 
@@ -31,22 +31,24 @@ class Snapshot(BaseModel):
 
 
 # =========================
-# Final live config
+# Final concentrated live config
 # =========================
-TOP_N = 3
+TOP_N = 2
 MOMENTUM_LOOKBACK = 60
 VOL_LOOKBACK = 20
 TREND_LOOKBACK = 20
 
 DOWNLOAD_PERIOD = "12mo"
 
-MIN_TRADE_DOLLARS = 750.0
+MIN_TRADE_DOLLARS = 300.0
 MIN_SHARE_DELTA = 0.10
-MIN_WEIGHT_CHANGE = 0.05
-MIN_SELECTED_WEIGHT = 0.15
+MIN_WEIGHT_CHANGE = 0.03
+MIN_TRADE_PCT = 0.05
 
-MAX_WEIGHT_SHIFT_PER_DAY = 0.15
-MAX_DAILY_TURNOVER = 0.35
+MIN_WEIGHT = 0.10
+MAX_WEIGHT = 0.60
+MAX_WEIGHT_SHIFT_PER_DAY = 0.20
+TURNOVER_CAP = 0.20
 
 REGIME_BENCHMARKS = ["SPY", "QQQ"]
 REGIME_MA_LOOKBACK = 200
@@ -54,7 +56,7 @@ RISK_OFF_INVESTED_WEIGHT = 0.35
 NORMAL_INVESTED_WEIGHT = 1.0
 
 LEVERAGED_TICKERS = {"SOXL", "TQQQ", "SPXL", "TECL", "UPRO", "FNGU"}
-LEVERAGED_ETF_CAP = 0.20
+LEVERAGED_ETF_CAP = 0.15
 
 REQUIRE_FULL_LOOKBACK = True
 USE_BENCHMARK_RELATIVE_FILTER = True
@@ -64,6 +66,9 @@ HIGH_CONFIDENCE_UNIVERSE = {
     "SPY", "QQQ", "XLK", "XLF", "XLE", "XLI", "XLY", "SMH", "SOXX",
     "NVDA", "AMD", "MSFT", "AAPL", "AMZN", "META", "AVGO", "SOXL"
 }
+
+SEMI_ETFS = {"SMH", "SOXL"}
+SEMI_NAMES = {"NVDA", "AMD", "AVGO"}
 
 
 def safe_div(a: float, b: float, default: float = 0.0) -> float:
@@ -190,33 +195,28 @@ def compute_model(close: pd.DataFrame, candidate_tickers: List[str]) -> Dict[str
 
     if USE_BENCHMARK_RELATIVE_FILTER and "SPY" in close.columns:
         spy_momentum = (close["SPY"] / close["SPY"].shift(MOMENTUM_LOOKBACK) - 1.0).iloc[-1]
-        latest_momentum = momentum.iloc[-1]
-        keep = latest_momentum > spy_momentum
+        keep = momentum.iloc[-1] > spy_momentum
         score.iloc[-1] = score.iloc[-1].where(keep)
 
     latest_score_row = score.iloc[-1].dropna().sort_values(ascending=False)
-    latest_momentum_row = momentum.iloc[-1].to_dict()
-    latest_trend_row = trend.iloc[-1].to_dict()
-    latest_vol_row = vol.iloc[-1].to_dict()
 
-    selected = latest_score_row.head(TOP_N).index.tolist()
+    selected = latest_score_row.head(max(TOP_N + 3, 5)).index.tolist()
+
+    # Prevent overlap: if any semi ETF selected, remove semi single names
+    if any(t in selected for t in SEMI_ETFS):
+        selected = [t for t in selected if t not in SEMI_NAMES]
+
+    selected = selected[:TOP_N]
 
     return {
         "latest_scores": {k: float(v) for k, v in latest_score_row.to_dict().items() if pd.notna(v)},
-        "latest_momentum": {k: float(v) for k, v in latest_momentum_row.items() if pd.notna(v)},
-        "latest_trend": {k: float(v) for k, v in latest_trend_row.items() if pd.notna(v)},
-        "latest_vol": {k: float(v) for k, v in latest_vol_row.items() if pd.notna(v)},
+        "latest_momentum": {k: float(v) for k, v in momentum.iloc[-1].to_dict().items() if pd.notna(v)},
+        "latest_trend": {k: float(v) for k, v in trend.iloc[-1].to_dict().items() if pd.notna(v)},
+        "latest_vol": {k: float(v) for k, v in vol.iloc[-1].to_dict().items() if pd.notna(v)},
         "selected": selected,
         "valid_tickers": valid_tickers,
         "regime": regime,
     }
-
-
-def apply_weight_shift_limit(current_weight: float, target_weight: float) -> float:
-    diff = target_weight - current_weight
-    if abs(diff) <= MAX_WEIGHT_SHIFT_PER_DAY:
-        return target_weight
-    return current_weight + (MAX_WEIGHT_SHIFT_PER_DAY if diff > 0 else -MAX_WEIGHT_SHIFT_PER_DAY)
 
 
 def apply_leveraged_cap(ticker: str, weight: float, risk_on: bool) -> float:
@@ -227,50 +227,68 @@ def apply_leveraged_cap(ticker: str, weight: float, risk_on: bool) -> float:
     return weight
 
 
-def enforce_min_selected_weight(weights: Dict[str, float], selected: List[str], target_sum: float) -> Dict[str, float]:
-    if not selected:
-        return {k: 0.0 for k in weights}
-    out = dict(weights)
-    positive_selected = [t for t in selected if out.get(t, 0.0) > 0]
-    if not positive_selected:
-        return out
+def cap_and_renormalize(weights: Dict[str, float], selected: List[str], target_sum: float) -> Dict[str, float]:
+    out = {k: max(0.0, v) for k, v in weights.items()}
 
-    floors = {t: MIN_SELECTED_WEIGHT for t in positive_selected}
-    floor_sum = sum(floors.values())
-    if floor_sum > target_sum:
-        scale = target_sum / floor_sum
-        floors = {k: v * scale for k, v in floors.items()}
+    # zero non-selected
+    for k in list(out.keys()):
+        if k not in selected:
+            out[k] = 0.0
 
-    current_sum = sum(max(0.0, out.get(t, 0.0)) for t in positive_selected)
-    if current_sum <= 0:
-        for t in positive_selected:
-            out[t] = floors[t]
-        return out
+    if not selected or target_sum <= 0:
+        return {k: 0.0 for k in out}
 
-    freed = 0.0
-    for t in list(out.keys()):
-        if t not in positive_selected:
-            freed += max(0.0, out[t])
-            out[t] = 0.0
+    # apply minimum weights to selected names
+    min_sum = MIN_WEIGHT * len(selected)
+    if min_sum > target_sum:
+        floor = target_sum / len(selected)
+        for t in selected:
+            out[t] = max(out.get(t, 0.0), floor)
+    else:
+        for t in selected:
+            out[t] = max(out.get(t, 0.0), MIN_WEIGHT)
 
-    for t in positive_selected:
-        out[t] = max(out.get(t, 0.0), floors[t])
+    # renormalize
+    total = sum(out.values())
+    if total > 0:
+        scale = target_sum / total
+        out = {k: v * scale for k, v in out.items()}
 
-    total = sum(max(0.0, out.get(k, 0.0)) for k in out)
-    if total <= 0:
-        return out
+    # apply max cap iteratively
+    for _ in range(10):
+        capped = {}
+        excess = 0.0
+        uncapped = []
+        for t in selected:
+            w = out.get(t, 0.0)
+            cap = LEVERAGED_ETF_CAP if t in LEVERAGED_TICKERS else MAX_WEIGHT
+            if w > cap:
+                capped[t] = cap
+                excess += w - cap
+            else:
+                capped[t] = w
+                uncapped.append(t)
 
-    scale = target_sum / total
-    out = {k: max(0.0, v) * scale for k, v in out.items()}
+        if excess <= 1e-12 or not uncapped:
+            out.update(capped)
+            break
+
+        uncapped_total = sum(capped[t] for t in uncapped)
+        if uncapped_total <= 0:
+            out.update(capped)
+            break
+
+        for t in uncapped:
+            capped[t] += excess * (capped[t] / uncapped_total)
+        out.update(capped)
+
+    # final renormalize
+    total = sum(out.values())
+    if total > 0:
+        scale = target_sum / total
+        out = {k: v * scale for k, v in out.items()}
+
     return out
-
-
-def rescale_weights(weights: Dict[str, float], target_sum: float) -> Dict[str, float]:
-    total = sum(max(0.0, v) for v in weights.values())
-    if total <= 0:
-        return {k: 0.0 for k in weights}
-    scale = target_sum / total
-    return {k: max(0.0, v) * scale for k, v in weights.items()}
 
 
 @app.get("/health")
@@ -375,20 +393,30 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
         for t in selected:
             ideal_weights[t] = equal_w
 
+    # leverage control + concentration rules
     adjusted = {}
     for p in positions:
         t = p["ticker"]
         adjusted[t] = apply_leveraged_cap(t, ideal_weights.get(t, 0.0), risk_on)
 
-    adjusted = enforce_min_selected_weight(adjusted, selected, target_invested_weight)
-    adjusted = rescale_weights(adjusted, target_invested_weight) if target_invested_weight > 0 else adjusted
+    adjusted = cap_and_renormalize(adjusted, selected, target_invested_weight)
 
     target_weights = {}
     for p in positions:
         t = p["ticker"]
         current_w = current_weight_map.get(t, 0.0)
         ideal_w = adjusted.get(t, 0.0)
-        shifted = apply_weight_shift_limit(current_w, ideal_w)
+
+        # selected names can move up faster, non-selected exit directly
+        if t in selected:
+            diff = ideal_w - current_w
+            if abs(diff) <= MAX_WEIGHT_SHIFT_PER_DAY:
+                shifted = ideal_w
+            else:
+                shifted = current_w + (MAX_WEIGHT_SHIFT_PER_DAY if diff > 0 else -MAX_WEIGHT_SHIFT_PER_DAY)
+        else:
+            shifted = 0.0
+
         shifted = apply_leveraged_cap(t, shifted, risk_on)
         target_weights[t] = max(0.0, shifted)
 
@@ -423,6 +451,8 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
             comments.append("leveraged_ticker")
         if not risk_on:
             comments.append("risk_off_regime")
+        if t in SEMI_NAMES and any(x in selected for x in SEMI_ETFS):
+            comments.append("excluded_by_overlap_rule")
         if weight > 0.20:
             comments.append("oversized")
         if sector_weight > 0.35:
@@ -461,6 +491,7 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
     suggested_targets.sort(key=lambda d: d["suggestedTargetWeight"], reverse=True)
 
     decision_trades = []
+    raw_priorities = {}
     for p in positions:
         t = p["ticker"]
         price = p["price"]
@@ -474,14 +505,13 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
         weight_change = suggested_weight - current_weight
 
         action_final = "HOLD"
-        if (
-            (abs(delta_dollar) >= MIN_TRADE_DOLLARS or abs(weight_change) >= MIN_WEIGHT_CHANGE)
-            and abs(share_change) >= MIN_SHARE_DELTA
-        ):
-            action_final = "BUY" if share_change > 0 else "SELL"
+        if abs(delta_dollar) >= total_value * MIN_TRADE_PCT:
+            if abs(share_change) >= MIN_SHARE_DELTA and (abs(delta_dollar) >= MIN_TRADE_DOLLARS or abs(weight_change) >= MIN_WEIGHT_CHANGE):
+                action_final = "BUY" if share_change > 0 else "SELL"
 
         conviction_score = float(latest_scores.get(t, 0.0))
-        priority_score = abs(delta_dollar) * (1.0 + abs(conviction_score))
+        raw_priority = abs(delta_dollar) * (1.0 + abs(conviction_score))
+        raw_priorities[t] = raw_priority
 
         decision_trades.append({
             "ticker": t,
@@ -494,11 +524,11 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
             "suggestedShares": round_shares(suggested_shares),
             "shareChange": round_shares(share_change),
             "actionFinal": action_final,
-            "priorityScore": round(priority_score, 2),
+            "priorityScore": 0.0,
         })
 
     total_abs_trade = sum(abs(t["deltaDollar"]) for t in decision_trades)
-    max_abs_trade = total_value * MAX_DAILY_TURNOVER
+    max_abs_trade = total_value * TURNOVER_CAP
     if total_abs_trade > max_abs_trade and total_abs_trade > 0:
         scale = max_abs_trade / total_abs_trade
         for t in decision_trades:
@@ -518,23 +548,29 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
             t["suggestedShares"] = round_shares(suggested_shares)
             t["shareChange"] = round_shares(share_change)
 
-            if (
-                (abs(t["deltaDollar"]) >= MIN_TRADE_DOLLARS or abs(weight_change) >= MIN_WEIGHT_CHANGE)
-                and abs(t["shareChange"]) >= MIN_SHARE_DELTA
-            ):
-                t["actionFinal"] = "BUY" if t["shareChange"] > 0 else "SELL"
+            if abs(t["deltaDollar"]) >= total_value * MIN_TRADE_PCT:
+                if abs(t["shareChange"]) >= MIN_SHARE_DELTA and (abs(t["deltaDollar"]) >= MIN_TRADE_DOLLARS or abs(weight_change) >= MIN_WEIGHT_CHANGE):
+                    t["actionFinal"] = "BUY" if t["shareChange"] > 0 else "SELL"
+                else:
+                    t["actionFinal"] = "HOLD"
             else:
                 t["actionFinal"] = "HOLD"
 
             conviction_score = float(latest_scores.get(t["ticker"], 0.0))
-            t["priorityScore"] = round(abs(t["deltaDollar"]) * (1.0 + abs(conviction_score)), 2)
+            raw_priorities[t["ticker"]] = abs(t["deltaDollar"]) * (1.0 + abs(conviction_score))
 
         portfolio_flags.append("turnover_capped")
+
+    max_priority = max(raw_priorities.values()) if raw_priorities else 1.0
+    if max_priority <= 0:
+        max_priority = 1.0
+    for t in decision_trades:
+        t["priorityScore"] = round(raw_priorities.get(t["ticker"], 0.0) / max_priority, 3)
 
     decision_trades.sort(key=lambda x: x["priorityScore"], reverse=True)
     actionable_trades = [t for t in decision_trades if t["actionFinal"] != "HOLD"]
 
-    if len(actionable_trades) >= 8:
+    if len(actionable_trades) >= 6:
         portfolio_flags.append("high_turnover_signal_load")
     if any(w > 0.35 for w in current_sector_weights.values()):
         portfolio_flags.append("sector_concentration_high")
@@ -553,7 +589,7 @@ def analyze(snapshot: Snapshot, x_analytics_secret: str = Header(default="")):
     top_buys = selected[:5]
     weakest = [d["ticker"] for d in diagnostics[-5:]]
 
-    top_actions = actionable_trades[:6]
+    top_actions = actionable_trades[:4]
     summary_lines = []
     if not top_actions:
         if selected:
