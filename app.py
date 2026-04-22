@@ -2,7 +2,8 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 
-SECRET = "PASTE_THE_SAME_SECRET_HERE"
+import os
+SECRET = os.environ["SECRET"]
 
 app = FastAPI()
 
